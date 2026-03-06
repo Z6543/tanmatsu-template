@@ -7,6 +7,7 @@ Connect to remote servers over SSH directly from your badge with a full interact
 ## Features
 
 - Multiple saved SSH connection profiles (host, port, username, password)
+- Public key authentication (private key stored in NVS via badgelink)
 - Interactive terminal emulator with ANSI escape sequence support
 - Host key fingerprint verification (SHA256) with NVS-based persistence
 - Man-in-the-middle attack detection (warns on host key changes)
@@ -63,6 +64,19 @@ The output binary is `build/tanmatsu/tanmatsu-ssh.bin`.
 | Tab | Tab completion |
 | Ctrl+key | Send control characters |
 | Volume +/- | Adjust font size |
+
+### Public Key Authentication
+
+You can store a PEM private key in NVS using badgelink. If a private key is present, it is tried first before falling back to password authentication.
+
+```bash
+# Write a private key for connection slot 0
+./badgelink.sh nvs write ssh s00.privkey blob /home/username/.ssh/id_rsa --file
+```
+
+The NVS key follows the pattern `s<XX>.privkey` where `XX` is the two-digit hex connection index (e.g. `s00`, `s01`). The connection edit menu shows whether a private key is set.
+
+If the private key is passphrase-protected, the password field is used as the passphrase. If public key auth fails, the client falls back to password authentication.
 
 ### Host Key Verification
 
