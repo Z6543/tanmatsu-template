@@ -24,7 +24,9 @@
 #include "pax_codecs.h"
 #include "tanmatsu_coprocessor.h"
 #include "wifi_connection.h"
+#include "esp_heap_caps.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include <libssh2.h>
 #include "libssh2_setup.h"
 #include "lwip/sockets.h"
@@ -52,6 +54,23 @@ static char const CHR_NL[] = "\n";
 
 // DECCKM (application cursor keys mode) - set by \e[?1h, reset by \e[?1l
 static bool decckm_mode = false;
+
+// F-key escape sequences (xterm style)
+// Fn+1..Fn+0 → F1..F10, Fn+hyphen → F11, Fn+equals → F12
+static const char* const fkey_sequences[] = {
+    [1] = "\eOP",       // F1
+    [2] = "\eOQ",       // F2
+    [3] = "\eOR",       // F3
+    [4] = "\eOS",       // F4
+    [5] = "\e[15~",     // F5
+    [6] = "\e[17~",     // F6
+    [7] = "\e[18~",     // F7
+    [8] = "\e[19~",     // F8
+    [9] = "\e[20~",     // F9
+    [0] = "\e[21~",     // F10
+    [10] = "\e[23~",    // F11
+    [11] = "\e[24~",    // F12
+};
 
 #if defined(CONFIG_BSP_TARGET_TANMATSU) || defined(CONFIG_BSP_TARGET_KONSOOL) || \
     defined(CONFIG_BSP_TARGET_HACKERHOTEL_2026)
@@ -164,7 +183,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     int rc; // return code from libssh2 library calls
     int i;
     struct sockaddr_in ssh_addr;
-    char ssh_buffer[1024];
+    char *ssh_buffer = NULL;
     char dialog_buffer[256];
     char ssh_password[128];
     LIBSSH2_SESSION *ssh_session;
@@ -442,23 +461,42 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 
     ESP_LOGI(TAG, "ssh setup completed, entering main loop");
 
+    ssh_buffer = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+    if (!ssh_buffer) {
+        ESP_LOGE(TAG, "failed to allocate SSH read buffer");
+        goto shutdown;
+    }
+
     while (1) {
         bsp_input_event_t event;
         if (xQueueReceive(input_event_queue, &event, pdMS_TO_TICKS(10)) == pdTRUE) {
             //ESP_LOGI(TAG, "input received");
             switch (event.type) {
                 case INPUT_EVENT_TYPE_KEYBOARD:
-		    //ESP_LOGI(TAG, "normal keyboard event received");
 		    ssh_out = event.args_keyboard.ascii;
+		    // Fn + number keys → send F-key escape sequences
+		    if (event.args_keyboard.modifiers & BSP_INPUT_MODIFIER_FUNCTION) {
+		        const char* fseq = NULL;
+		        if (ssh_out >= '0' && ssh_out <= '9') {
+		            int idx = ssh_out - '0';
+		            fseq = fkey_sequences[idx];
+		        } else if (ssh_out == '-') {
+		            fseq = fkey_sequences[10]; // F11
+		        } else if (ssh_out == '=') {
+		            fseq = fkey_sequences[11]; // F12
+		        }
+		        if (fseq) {
+		            libssh2_channel_write(ssh_channel, fseq, strlen(fseq));
+		            break;
+		        }
+		    }
 		    if (event.args_keyboard.modifiers & BSP_INPUT_MODIFIER_CTRL) {
-			//ESP_LOGI(TAG, "applying CTRL modifier");
-                        ssh_out &= 0x1f; // modify the keycode sent to make it a control character
+                        ssh_out &= 0x1f;
 		    }
 		    // Skip characters that are also handled as navigation events to avoid double-send
 		    if (ssh_out == '\t' || ssh_out == '\n' || ssh_out == '\r' || ssh_out == '\x1b' || ssh_out == '\x7f' || ssh_out == '\b') {
 		        break;
 		    }
-		    // TODO: Add support for other modifiers where needed, e.g. ALT, FN
                     libssh2_channel_write(ssh_channel, &ssh_out, sizeof(ssh_out));
                     break;
 		case INPUT_EVENT_TYPE_NONE:
@@ -608,101 +646,91 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 	    }
         }
 
-	//ESP_LOGI(TAG, "check for server EOF");
         if (libssh2_channel_eof(ssh_channel)) {
             ESP_LOGI(TAG, "server sent EOF");
-	    goto shutdown;
+            goto shutdown;
             break;
         }
 
-        //ESP_LOGI(TAG, "read any data sent by server");
-        bzero(ssh_buffer, sizeof(ssh_buffer));
-        nbytes = libssh2_channel_read(ssh_channel, ssh_buffer, sizeof(ssh_buffer));
-        //if (nbytes < 0) {
-        //    ESP_LOGE(TAG, "unable to read response");
-        //    break;
-        //}
+        // Read available data from SSH channel, batching into a single display
+        // update. Cap at ~50ms to keep the screen responsive during large output.
+        bool got_data = false;
+        int64_t read_start = esp_timer_get_time();
+        do {
+            nbytes = libssh2_channel_read(ssh_channel, ssh_buffer, 8192);
+            if (nbytes <= 0) break;
+            got_data = true;
 
-	//ESP_LOGI(TAG, "display data sent by server");
-	if (nbytes > 0) {
+            // Parse ANSI escape sequences
+            char* p = ssh_buffer;
+            char* end = ssh_buffer + nbytes;
+            while (p < end) {
+                if (*p == '\x1b' && p + 1 < end && *(p+1) == '[') {
+                    // CSI sequence: ESC[
+                    p += 2;
+                    char seq[32] = {0};
+                    int si = 0;
+                    while (p < end && si < 31) {
+                        if ((*p >= '0' && *p <= '9') || *p == ';' || *p == '?') {
+                            seq[si++] = *p++;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (p < end) {
+                        char cmd = *p++;
+                        if (cmd == 'J' && strcmp(seq, "2") == 0) {
+                            console_clear(&console_instance);
+                            pax_draw_rect(buffer, 0xff000000, 0, 0,
+                                          pax_buf_get_width(buffer), pax_buf_get_height(buffer));
+                            if (ssh_bg_pax_buf.width > 0) {
+                                pax_draw_image(buffer, &ssh_bg_pax_buf, 0, 0);
+                            }
+                            console_set_cursor(&console_instance, 0, 0);
+                            cx = cy = ocx = ocy = 0;
+                        } else if (cmd == 'H' || cmd == 'f') {
+                            int row = 1, col = 1;
+                            if (seq[0]) sscanf(seq, "%d;%d", &row, &col);
+                            console_set_cursor(&console_instance, col - 1, row - 1);
+                        } else if (cmd == 'h' && strcmp(seq, "?1") == 0) {
+                            decckm_mode = true;
+                        } else if (cmd == 'l' && strcmp(seq, "?1") == 0) {
+                            decckm_mode = false;
+                        } else {
+                            char esc_seq[64];
+                            snprintf(esc_seq, sizeof(esc_seq), "\x1b[%s%c", seq, cmd);
+                            console_puts(&console_instance, esc_seq);
+                        }
+                    }
+                } else if (*p == 0x08) {
+                    if (console_instance.cursor_x > 0) {
+                        console_instance.cursor_x--;
+                        int erase_x = console_instance.char_width * console_instance.cursor_x;
+                        int erase_y = console_instance.char_height * console_instance.cursor_y;
+                        pax_draw_rect(buffer, console_instance.bg,
+                                     erase_x, erase_y,
+                                     console_instance.char_width, console_instance.char_height);
+                    }
+                    p++;
+                } else {
+                    console_put(&console_instance, *p++);
+                }
+            }
+        } while (nbytes > 0 && (esp_timer_get_time() - read_start) < 50000);
 
-	    // Parse ANSI escape sequences
-	    char* p = ssh_buffer;
-	    while (p < ssh_buffer + nbytes) {
-	        if (*p == '\x1b' && p + 1 < ssh_buffer + nbytes && *(p+1) == '[') {
-	            // CSI sequence: ESC[
-	            p += 2;
-	            char seq[32] = {0};
-	            int i = 0;
-	            // Parse parameters
-	            while (p < ssh_buffer + nbytes && i < 31) {
-	                if ((*p >= '0' && *p <= '9') || *p == ';' || *p == '?') {
-	                    seq[i++] = *p++;
-	                } else {
-	                    break;
-	                }
-	            }
-	            if (p < ssh_buffer + nbytes) {
-	                char cmd = *p++;
-	                if (cmd == 'J' && strcmp(seq, "2") == 0) {
-	                    // Clear screen
-	                    console_clear(&console_instance);
-	                    pax_draw_rect(buffer, 0xff000000, 0, 0, 800, 480);
-	                    if (ssh_bg_pax_buf.width > 0) {
-	                        pax_draw_image(buffer, &ssh_bg_pax_buf, 0, 0);
-	                    }
-	                    console_set_cursor(&console_instance, 0, 0);
-	                    cx = cy = ocx = ocy = 0;
-	                } else if (cmd == 'H' || cmd == 'f') {
-	                    // Cursor position
-	                    int row = 1, col = 1;
-	                    if (seq[0]) sscanf(seq, "%d;%d", &row, &col);
-	                    console_set_cursor(&console_instance, col - 1, row - 1);
-	                } else if (cmd == 'h' && strcmp(seq, "?1") == 0) {
-	                    // DECCKM set - application cursor keys mode
-	                    ESP_LOGI(TAG, "DECCKM enabled (application cursor keys)");
-	                    decckm_mode = true;
-	                } else if (cmd == 'l' && strcmp(seq, "?1") == 0) {
-	                    // DECCKM reset - normal cursor keys mode
-	                    ESP_LOGI(TAG, "DECCKM disabled (normal cursor keys)");
-	                    decckm_mode = false;
-	                } else {
-	                    // Pass through other sequences
-	                    char esc_seq[64];
-	                    snprintf(esc_seq, sizeof(esc_seq), "\x1b[%s%c", seq, cmd);
-	                    console_puts(&console_instance, esc_seq);
-	                }
-	            }
-	        } else if (*p == 0x08) {
-	            // Backspace: erase previous character and move cursor left
-	            ESP_LOGI(TAG, "Detected BS (0x08), erasing character and moving cursor left from x=%d", console_instance.cursor_x);
-	            if (console_instance.cursor_x > 0) {
-	                console_instance.cursor_x--;
-	                int erase_x = console_instance.char_width * console_instance.cursor_x;
-	                int erase_y = console_instance.char_height * console_instance.cursor_y;
-	                // Erase the character at the new cursor position
-	                pax_draw_rect(buffer, console_instance.bg,
-	                             erase_x, erase_y,
-	                             console_instance.char_width, console_instance.char_height);
-	            }
-	            p++;
-	        } else {
-	            console_put(&console_instance, *p++);
-	        }
-	    }
-	    
-	    // Draw cursor
-	    cx = console_instance.char_width * console_instance.cursor_x;
-	    cy = console_instance.char_height * console_instance.cursor_y;
-	    if (ocx != 0 || ocy != 0) {
-	        pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
-	    }
-	    ocx = cx;
-	    ocy = cy;
-	    pax_draw_line(buffer, 0xffefefef, cx, cy, cx, cy + (console_instance.char_height - 1));
-	    
+        if (got_data) {
+            // Draw cursor
+            cx = console_instance.char_width * console_instance.cursor_x;
+            cy = console_instance.char_height * console_instance.cursor_y;
+            if (ocx != 0 || ocy != 0) {
+                pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
+            }
+            ocx = cx;
+            ocy = cy;
+            pax_draw_line(buffer, 0xffefefef, cx, cy, cx, cy + (console_instance.char_height - 1));
+
             display_blit_buffer(buffer);
-	}
+        }
     }
  
     // closing the ssh connection and freeing resources
@@ -720,5 +748,6 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
         shutdown(ssh_sock, 2);
         LIBSSH2_SOCKET_CLOSE(ssh_sock);
     }
-    libssh2_exit();	
+    libssh2_exit();
+    free(ssh_buffer);
 }
