@@ -35,15 +35,23 @@ extern bool wifi_stack_get_initialized(void);
 
 static char const TAG[] = "util_ssh";
 
-// XXX probably not the right way to be doing this
+// Normal cursor mode sequences (CSI)
 static char const CSI_LEFT[] = "\e[D";
 static char const CSI_RIGHT[] = "\e[C";
 static char const CSI_UP[] = "\e[A";
 static char const CSI_DOWN[] = "\e[B";
+// Application cursor mode sequences (SS3) - used by mc, vim, etc.
+static char const SS3_LEFT[] = "\eOD";
+static char const SS3_RIGHT[] = "\eOC";
+static char const SS3_UP[] = "\eOA";
+static char const SS3_DOWN[] = "\eOB";
 static char const CHR_TAB[] = "\t";
 //static char const CHR_BS[] = "\b";
 static char const CHR_BS[] = "\x7f";
 static char const CHR_NL[] = "\n";
+
+// DECCKM (application cursor keys mode) - set by \e[?1h, reset by \e[?1l
+static bool decckm_mode = false;
 
 #if defined(CONFIG_BSP_TARGET_TANMATSU) || defined(CONFIG_BSP_TARGET_KONSOOL) || \
     defined(CONFIG_BSP_TARGET_HACKERHOTEL_2026)
@@ -177,6 +185,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     //console_set_colors(&console_instance, CONS_COL_VGA_GREEN, CONS_COL_VGA_BLACK);
     console_instance.fg = 0xff00ff00;
     console_instance.bg = 0xff000000;
+    decckm_mode = false;
     keyboard_backlight();
 
     //busy_dialog(get_icon(ICON_TERMINAL), "SSH", "Connecting to WiFi...");
@@ -399,9 +408,14 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 
     ESP_LOGI(TAG, "requesting pty");
     console_printf(&console_instance, "Requesting pseudoterminal for interactive login session...\n");
-    // TODO: Let user set terminal type?
-    // TODO: Test with TERM xterm-color etc
-    if (libssh2_channel_request_pty(ssh_channel, "xterm-256color")) {
+    // Use actual terminal dimensions from the console instance
+    int pty_cols = console_instance.chars_x;
+    int pty_rows = console_instance.chars_y;
+    int pty_width_px = pax_buf_get_width(buffer);
+    int pty_height_px = pax_buf_get_height(buffer);
+    ESP_LOGI(TAG, "PTY size: %d cols x %d rows (%d x %d px)", pty_cols, pty_rows, pty_width_px, pty_height_px);
+    if (libssh2_channel_request_pty_ex(ssh_channel, "xterm-256color", strlen("xterm-256color"),
+                                        NULL, 0, pty_cols, pty_rows, pty_width_px, pty_height_px)) {
         ESP_LOGE(TAG, "failed requesting pty");
         return;
     }
@@ -439,6 +453,10 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 		    if (event.args_keyboard.modifiers & BSP_INPUT_MODIFIER_CTRL) {
 			//ESP_LOGI(TAG, "applying CTRL modifier");
                         ssh_out &= 0x1f; // modify the keycode sent to make it a control character
+		    }
+		    // Skip characters that are also handled as navigation events to avoid double-send
+		    if (ssh_out == '\t' || ssh_out == '\n' || ssh_out == '\r' || ssh_out == '\x1b' || ssh_out == '\x7f' || ssh_out == '\b') {
+		        break;
 		    }
 		    // TODO: Add support for other modifiers where needed, e.g. ALT, FN
                     libssh2_channel_write(ssh_channel, &ssh_out, sizeof(ssh_out));
@@ -494,19 +512,35 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 				break;
 			    case BSP_INPUT_NAVIGATION_KEY_LEFT:
 				ESP_LOGI(TAG, "left key pressed");
-                                libssh2_channel_write(ssh_channel, CSI_LEFT, strlen(CSI_LEFT));
+                                if (decckm_mode) {
+                                    libssh2_channel_write(ssh_channel, SS3_LEFT, strlen(SS3_LEFT));
+                                } else {
+                                    libssh2_channel_write(ssh_channel, CSI_LEFT, strlen(CSI_LEFT));
+                                }
 				break;
             		    case BSP_INPUT_NAVIGATION_KEY_RIGHT:
 				ESP_LOGI(TAG, "right key pressed");
-                                libssh2_channel_write(ssh_channel, CSI_RIGHT, strlen(CSI_RIGHT));
+                                if (decckm_mode) {
+                                    libssh2_channel_write(ssh_channel, SS3_RIGHT, strlen(SS3_RIGHT));
+                                } else {
+                                    libssh2_channel_write(ssh_channel, CSI_RIGHT, strlen(CSI_RIGHT));
+                                }
 				break;
             		    case BSP_INPUT_NAVIGATION_KEY_UP:
 				ESP_LOGI(TAG, "up key pressed");
-                                libssh2_channel_write(ssh_channel, CSI_UP, strlen(CSI_UP));
+                                if (decckm_mode) {
+                                    libssh2_channel_write(ssh_channel, SS3_UP, strlen(SS3_UP));
+                                } else {
+                                    libssh2_channel_write(ssh_channel, CSI_UP, strlen(CSI_UP));
+                                }
 				break;
             		    case BSP_INPUT_NAVIGATION_KEY_DOWN:
 				ESP_LOGI(TAG, "down key pressed");
-                                libssh2_channel_write(ssh_channel, CSI_DOWN, strlen(CSI_DOWN));
+                                if (decckm_mode) {
+                                    libssh2_channel_write(ssh_channel, SS3_DOWN, strlen(SS3_DOWN));
+                                } else {
+                                    libssh2_channel_write(ssh_channel, CSI_DOWN, strlen(CSI_DOWN));
+                                }
 				break;
             		    case BSP_INPUT_NAVIGATION_KEY_TAB:
 				ESP_LOGI(TAG, "tab key pressed");
@@ -624,6 +658,14 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 	                    int row = 1, col = 1;
 	                    if (seq[0]) sscanf(seq, "%d;%d", &row, &col);
 	                    console_set_cursor(&console_instance, col - 1, row - 1);
+	                } else if (cmd == 'h' && strcmp(seq, "?1") == 0) {
+	                    // DECCKM set - application cursor keys mode
+	                    ESP_LOGI(TAG, "DECCKM enabled (application cursor keys)");
+	                    decckm_mode = true;
+	                } else if (cmd == 'l' && strcmp(seq, "?1") == 0) {
+	                    // DECCKM reset - normal cursor keys mode
+	                    ESP_LOGI(TAG, "DECCKM disabled (normal cursor keys)");
+	                    decckm_mode = false;
 	                } else {
 	                    // Pass through other sequences
 	                    char esc_seq[64];
