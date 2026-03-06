@@ -384,29 +384,60 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     ESP_LOGI(TAG, "user auth methods list: %s", ssh_userauthlist);
     console_printf(&console_instance, "Host supports auth methods... %s\n", ssh_userauthlist);
 
-    ESP_LOGI(TAG, "checking to see if we have a saved password as part of this connection");
+    // Password authentication with retry support
     if (strlen(settings->password) > 0) {
         ESP_LOGI(TAG, "using saved password");
-	strncpy(ssh_password, settings->password, strlen(settings->password));
+        strncpy(ssh_password, settings->password, sizeof(ssh_password) - 1);
+        ssh_password[sizeof(ssh_password) - 1] = '\0';
     } else {
-        ESP_LOGI(TAG, "no saved password, so let's prompt the user for one");
-        bool accepted  = false;
-        memset(ssh_password, 0, sizeof(ssh_password)); // don't display the password
-    
-        menu_textedit(buffer, theme, "Password", ssh_password, sizeof(settings->password) + sizeof('\0'), true, &accepted);
-        if (accepted) {
-            ESP_LOGI(TAG, "updated password: <redacted>");
-            //ESP_LOGI(TAG, "updated password: %s", ssh_password);
-        } 
+        memset(ssh_password, 0, sizeof(ssh_password));
     }
 
-    ESP_LOGI(TAG, "authenticating to %s:%s as user %s", settings->dest_host, settings->dest_port, settings->username);
-    console_printf(&console_instance, "Authenticating to %s:%s as user %s", settings->dest_host, settings->dest_port, settings->username);
-    if (libssh2_userauth_password(ssh_session, settings->username, settings->password)) {
-        ESP_LOGE(TAG, "authentication by password failed");
-        return;
+    int max_auth_attempts = 3;
+    for (int attempt = 0; attempt < max_auth_attempts; attempt++) {
+        // Prompt for password if we don't have one (first time or after failed attempt)
+        if (strlen(ssh_password) == 0) {
+            bool accepted = false;
+            menu_textedit(buffer, theme, "Password", ssh_password, sizeof(ssh_password), true, &accepted);
+            if (!accepted || strlen(ssh_password) == 0) {
+                ESP_LOGI(TAG, "user cancelled password entry");
+                libssh2_session_disconnect(ssh_session, "User cancelled authentication");
+                libssh2_session_free(ssh_session);
+                shutdown(ssh_sock, 2);
+                LIBSSH2_SOCKET_CLOSE(ssh_sock);
+                libssh2_exit();
+                return;
+            }
+        }
+
+        ESP_LOGI(TAG, "authenticating to %s:%s as user %s (attempt %d/%d)",
+                 settings->dest_host, settings->dest_port, settings->username, attempt + 1, max_auth_attempts);
+        console_printf(&console_instance, "Authenticating to %s:%s as %s...\n",
+                       settings->dest_host, settings->dest_port, settings->username);
+        display_blit_buffer(buffer);
+
+        if (libssh2_userauth_password(ssh_session, settings->username, ssh_password) == 0) {
+            ESP_LOGI(TAG, "authentication by password succeeded");
+            break;
+        }
+
+        ESP_LOGE(TAG, "authentication by password failed (attempt %d/%d)", attempt + 1, max_auth_attempts);
+        memset(ssh_password, 0, sizeof(ssh_password));
+
+        if (attempt + 1 < max_auth_attempts) {
+            message_dialog(get_icon(ICON_ERROR), "Authentication failed",
+                          "Incorrect password. Please try again.", "Retry");
+        } else {
+            message_dialog(get_icon(ICON_ERROR), "Authentication failed",
+                          "Too many failed attempts.", "Go back");
+            libssh2_session_disconnect(ssh_session, "Authentication failed");
+            libssh2_session_free(ssh_session);
+            shutdown(ssh_sock, 2);
+            LIBSSH2_SOCKET_CLOSE(ssh_sock);
+            libssh2_exit();
+            return;
+        }
     }
-    ESP_LOGE(TAG, "authentication by password succeeded");
 
     // TODO: Support keyboard_interactive auth
     // TODO: Support public key auth
