@@ -35,6 +35,7 @@ typedef enum {
     ACTION_USERNAME,
     ACTION_AUTH_MODE,
     ACTION_PASSWORD,
+    ACTION_PRIVATE_KEY,
     ACTION_LAST,
 } menu_ssh_edit_action_t;
 
@@ -75,7 +76,7 @@ const char* ssh_auth_mode_to_string(ssh_auth_mode_t auth_mode) {
 //    }
 //}
 
-static void menu_populate(menu_t* menu, ssh_settings_t* settings) {
+static void menu_populate(menu_t* menu, ssh_settings_t* settings, uint8_t index) {
     ESP_LOGI(TAG, "starting menu_populate()");
 
     size_t previous_position = menu_get_position(menu);
@@ -112,6 +113,10 @@ static void menu_populate(menu_t* menu, ssh_settings_t* settings) {
     memset(temp, 0, sizeof(temp)); // don't display the password
     ESP_LOGI(TAG, "password: <redacted>");
     menu_insert_item_value(menu, "Password", temp, NULL, (void*)ACTION_PASSWORD, -1);
+
+    // Show private key status (read-only, set via badgelink)
+    bool has_key = ssh_settings_has_private_key(index);
+    menu_insert_item_value(menu, "Private Key", has_key ? "Set" : "Not set", NULL, (void*)ACTION_PRIVATE_KEY, -1);
 
     if (previous_position >= menu_get_length(menu)) {
         previous_position = menu_get_length(menu) - 1;
@@ -293,7 +298,7 @@ bool menu_ssh_edit(pax_buf_t* buffer, gui_theme_t* theme, uint8_t index, bool ne
     // Menu for parameters
     menu_t menu = {0};
     menu_initialize(&menu);
-    menu_populate(&menu, &settings);
+    menu_populate(&menu, &settings, index);
 
     int header_height = theme->header.height + (theme->header.vertical_margin * 2);
     int footer_height = theme->footer.height + (theme->footer.vertical_margin * 2);
@@ -365,6 +370,10 @@ bool menu_ssh_edit(pax_buf_t* buffer, gui_theme_t* theme, uint8_t index, bool ne
                                         break;
                                     case ACTION_PASSWORD:
                                         edit_password(buffer, theme, &menu, &settings);
+                                        break;
+                                    case ACTION_PRIVATE_KEY:
+                                        message_dialog(get_icon(ICON_TERMINAL), "Private Key",
+                                                       "Use badgelink to write a PEM private key to NVS.", "OK");
                                         break;
                                     default:
                                         break;
